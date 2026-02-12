@@ -1,4 +1,5 @@
 import logging
+from os import path
 from pathlib import Path
 
 import numpy as np
@@ -6,13 +7,12 @@ from rapidocr import RapidOCR, EngineType
 
 logger = logging.getLogger(__name__)
 
-# ── Model paths ──────────────────────────────────────────────────────────────
-
-MODEL_DIR = "models"
-DET_MODEL = f"{MODEL_DIR}/det/inference.pdmodel"
-DET_PARAMS = f"{MODEL_DIR}/det/inference.pdiparams"
-REC_MODEL = f"{MODEL_DIR}/rec/inference.pdmodel"
-REC_PARAMS = f"{MODEL_DIR}/rec/inference.pdiparams"
+# ── Model paths (Paddle format — only usable with the Paddle backend) ────────
+MODEL_DIR = Path(__file__).resolve().parent.parent / "models"
+DET_MODEL = MODEL_DIR / "det" / "inference.pdmodel"
+DET_PARAMS = MODEL_DIR / "det" / "inference.pdiparams"
+REC_MODEL = MODEL_DIR / "rec" / "inference.pdmodel"
+REC_PARAMS = MODEL_DIR / "rec" / "inference.pdiparams"
 
 _ocr_engine: RapidOCR | None = None
 
@@ -20,6 +20,7 @@ _ocr_engine: RapidOCR | None = None
 # ── Internal helpers ─────────────────────────────────────────────────────────
 
 def _has_paddle_gpu() -> bool:
+    """Return True when paddlepaddle-gpu is installed AND a CUDA device is visible."""
     try:
         import paddle
         return paddle.is_compiled_with_cuda() and paddle.device.cuda.device_count() > 0
@@ -27,26 +28,28 @@ def _has_paddle_gpu() -> bool:
         return False
 
 
-def _has_paddle() -> bool:
-    try:
-        import paddle  # noqa: F401
-        return True
-    except ImportError:
-        return False
-
-
-def _custom_models_exist() -> bool:
-    return all(Path(p).exists() for p in (DET_MODEL, DET_PARAMS, REC_MODEL, REC_PARAMS))
+def _custom_paddle_models_exist() -> bool:
+    """Return True when all four Paddle model files are present on disk."""
+    return all(p.exists() for p in (DET_MODEL, DET_PARAMS, REC_MODEL, REC_PARAMS))
 
 
 def _build_engine() -> RapidOCR:
-    """Build the best available OCR engine, falling back gracefully."""
-    use_custom = _custom_models_exist()
+    """Build the OCR engine.
 
-    # Try 1: Paddle + CUDA
+    Strategy
+    --------
+    * **GPU available (Paddle + CUDA)** — use the Paddle backend so we can also
+      load custom ``.pdmodel`` / ``.pdiparams`` models when they exist.
+    * **No GPU** — use ONNX Runtime (CPU).  Custom Paddle-format models are
+      *not* compatible with ONNX Runtime, so RapidOCR's bundled models are used
+      instead.  If ONNX Runtime also fails, fall back to bare RapidOCR defaults.
+    """
+
+    # ── Path A: Paddle + CUDA (GPU) ──────────────────────────────────────
     if _has_paddle_gpu():
+        use_custom = _custom_paddle_models_exist()
         try:
-            params = {
+            params: dict = {
                 "Global.text_score": 0.5,
                 "Global.use_cls": False,
                 "Det.engine_type": EngineType.PADDLE,
@@ -55,41 +58,21 @@ def _build_engine() -> RapidOCR:
             }
             if use_custom:
                 params.update({
-                    "Det.model_path": DET_MODEL,
-                    "Det.params_path": DET_PARAMS,
-                    "Rec.model_path": REC_MODEL,
-                    "Rec.params_path": REC_PARAMS,
+                    "Det.model_path": str(DET_MODEL),
+                    "Det.params_path": str(DET_PARAMS),
+                    "Rec.model_path": str(REC_MODEL),
+                    "Rec.params_path": str(REC_PARAMS),
                 })
             engine = RapidOCR(params=params)
-            logger.info("OCR engine: Paddle + CUDA%s", " (custom models)" if use_custom else "")
+            logger.info(
+                "OCR engine: Paddle + CUDA%s",
+                " (custom models)" if use_custom else "",
+            )
             return engine
-        except Exception as e:
-            logger.warning("Paddle GPU failed (%s), trying next…", e)
+        except Exception as exc:
+            logger.warning("Paddle GPU init failed (%s) — falling back to ONNX Runtime", exc)
 
-    # Try 2: Paddle + CPU
-    if _has_paddle():
-        try:
-            params = {
-                "Global.text_score": 0.5,
-                "Global.use_cls": False,
-                "Det.engine_type": EngineType.PADDLE,
-                "Rec.engine_type": EngineType.PADDLE,
-                "EngineConfig.paddle.use_cuda": False,
-            }
-            if use_custom:
-                params.update({
-                    "Det.model_path": DET_MODEL,
-                    "Det.params_path": DET_PARAMS,
-                    "Rec.model_path": REC_MODEL,
-                    "Rec.params_path": REC_PARAMS,
-                })
-            engine = RapidOCR(params=params)
-            logger.info("OCR engine: Paddle + CPU%s", " (custom models)" if use_custom else "")
-            return engine
-        except Exception as e:
-            logger.warning("Paddle CPU failed (%s), trying next…", e)
-
-    # Try 3: ONNX Runtime (auto-detects CUDA/CPU)
+    # ── Path B: ONNX Runtime (CPU, no GPU) ───────────────────────────────
     try:
         engine = RapidOCR(params={
             "Global.text_score": 0.5,
@@ -97,13 +80,13 @@ def _build_engine() -> RapidOCR:
             "Det.engine_type": EngineType.ONNXRUNTIME,
             "Rec.engine_type": EngineType.ONNXRUNTIME,
         })
-        logger.info("OCR engine: ONNX Runtime")
+        logger.info("OCR engine: ONNX Runtime (CPU)")
         return engine
-    except Exception as e:
-        logger.warning("ONNX Runtime failed (%s), trying next…", e)
+    except Exception as exc:
+        logger.warning("ONNX Runtime init failed (%s) — using RapidOCR defaults", exc)
 
-    # Try 4: bare defaults
-    logger.warning("All preferred backends failed — using RapidOCR defaults")
+    # ── Path C: last-resort bare defaults ────────────────────────────────
+    logger.warning("All preferred backends unavailable — using RapidOCR defaults")
     return RapidOCR()
 
 
@@ -146,23 +129,6 @@ def run_ocr(img: np.ndarray) -> dict:
 
 if __name__ == "__main__":
     import cv2
-    import sys
-
-    logging.basicConfig(level=logging.INFO, format="%(message)s")
-
-    if len(sys.argv) < 2:
-        print("Usage: python image_processing.py <image_path>")
-        sys.exit(1)
-
-    img = cv2.imread(sys.argv[1])
-    if img is None:
-        print(f"Error: could not read '{sys.argv[1]}'")
-        sys.exit(1)
-
-    result = run_ocr(img)
-
-    if result["texts"]:
-        for txt, score in zip(result["texts"], result["scores"]):
-            print(f"  [{score:.2f}] {txt}")
-    else:
-        print("No text detected.")
+    path = r"image.png"
+    data = run_ocr(cv2.imread(path))
+    print(data)
