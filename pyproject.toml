@@ -1,0 +1,18 @@
+[tool.poetry]
+name = "nextcua"
+version = "0.1.0"
+description = "Model trained to predit next action"
+authors = ["Realgamer7067 <khantjaimin37@gmail.com>"]
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = ">=3.10,<4"
+rapidocr = ">=3.6.0,<4.0.0"
+# paddlepaddle-gpu = ">=3.0.0,<4.0.0"  # skipped - not available for this platform
+opencv-python = ">=4.0.0,<5.0.0"
+numpy = ">=1.24.0,<3.0.0"
+onnxruntime = "^1.24.1"
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"
