@@ -1,0 +1,8 @@
+# Session recordings (large video + event data)
+.sessions/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
