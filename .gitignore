@@ -1,6 +1,9 @@
 # Session recordings (large video + event data)
 .sessions/
 
+# Processed dataset
+.data/
+
 # Python
 __pycache__/
 *.pyc
