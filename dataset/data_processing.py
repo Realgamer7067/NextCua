@@ -4,9 +4,31 @@ import json
 import shutil
 import cv2
 from pathlib import Path
+from rapidocr import RapidOCR,EngineType,LangDet,ModelType,OCRVersion,LangRec
+
+
+
 
 SESSIONS_DIR = Path(__file__).parent.parent / ".sessions"
 DATA_DIR = Path(__file__).parent.parent / ".data"
+REC_MODEL = r"dataset/models/RapidOCR/en_PP-OCRv5_rec_mobile_infer.onnx"
+DET_MODEL = r"dataset/models/RapidOCR/ch_PP-OCRv5_mobile_det.onnx"
+engine = RapidOCR(
+    params={
+        "Det.engine_type": EngineType.PADDLE,
+        "Det.lang_type": LangDet.EN,
+        # "Det.model_path": DET_MODEL,
+        "Det.model_type": ModelType.MOBILE,
+        "Det.ocr_version": OCRVersion.PPOCRV4,
+        "Rec.engine_type": EngineType.PADDLE,
+        "Rec.lang_type": LangRec.EN,
+        # "Rec.model_path": REC_MODEL,
+        "Rec.model_type": ModelType.MOBILE,
+        "Rec.ocr_version": OCRVersion.PPOCRV5,
+        "EngineConfig.paddle.use_cuda": True,
+        "EngineConfig.paddle.cuda_ep_cfg.device_id": 0
+    }
+)
 
 
 def extract_frame(video_path, timestamp_sec):
@@ -14,23 +36,34 @@ def extract_frame(video_path, timestamp_sec):
     if not cap.isOpened():
         print(f"  ERROR: Could not open {video_path}")
         return None
-    cap.set(cv2.CAP_PROP_POS_MSEC, timestamp_sec * 1000)
+    # try requested time (ms)
+    cap.set(cv2.CAP_PROP_POS_MSEC, float(timestamp_sec) * 1000.0)
     ret, frame = cap.read()
-    cap.release()
     if not ret:
+        # try fallback to last frame
+        try:
+            frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+            if frame_count > 0:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, max(0, frame_count - 1))
+                ret, frame = cap.read()
+                if ret:
+                    cap.release()
+                    return frame
+        except Exception:
+            pass
+        cap.release()
         print(f"  ERROR: Could not read frame at {timestamp_sec:.3f}s")
         return None
+    cap.release()
     return frame
 
 
 def run_ocr(frame):
-    # TODO: implement OCR — return list of detected text regions
-    # expected format:
-    # [
-    #     {"text": "File", "bbox": [x1, y1, x2, y2], "confidence": 0.98},
-    #     ...
-    # ]
-    return []
+    try:
+        results = engine(frame, use_cls=False)
+    except Exception as e:
+        return {"error": f"ocr_error: {e}"}
+    return results
 
 
 def run_cv(frame):
@@ -43,18 +76,68 @@ def run_cv(frame):
     return []
 
 
+def _make_serializable(obj):
+    # basic primitives
+    if obj is None or isinstance(obj, (str, int, float, bool)):
+        return obj
+    if isinstance(obj, dict):
+        return {k: _make_serializable(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_make_serializable(v) for v in obj]
+    # rapidocr types may provide to_dict/to_json
+    if hasattr(obj, "to_dict") and callable(obj.to_dict):
+        try:
+            return _make_serializable(obj.to_dict())
+        except Exception:
+            pass
+    if hasattr(obj, "as_dict") and callable(obj.as_dict):
+        try:
+            return _make_serializable(obj.as_dict())
+        except Exception:
+            pass
+    if hasattr(obj, "to_json") and callable(obj.to_json):
+        try:
+            import json as _json
+
+            return _make_serializable(_json.loads(obj.to_json()))
+        except Exception:
+            pass
+    # fallback to __dict__ if available
+    if hasattr(obj, "__dict__"):
+        try:
+            return _make_serializable(vars(obj))
+        except Exception:
+            pass
+    # last resort: string representation
+    try:
+        return str(obj)
+    except Exception:
+        return {"error": "unserializable_object"}
+
+
 def process_event(event, video_path, frame_dir, event_idx):
     timestamp_sec = event["timestamp_sec"]
     frame = extract_frame(video_path, timestamp_sec)
     if frame is None:
-        return None
+        # record the event with an error flag instead of skipping entirely
+        return {**event, "frame": None, "ocr": {"error": "no_frame"}, "cv": {"error": "no_frame"}}
 
     frame_filename = f"frame_{event_idx:05d}.png"
     frame_path = frame_dir / frame_filename
     cv2.imwrite(str(frame_path), frame)
 
-    ocr_data = run_ocr(frame)
-    cv_data = run_cv(frame)
+    try:
+        ocr_data = run_ocr(frame)
+    except Exception as e:
+        ocr_data = {"error": f"ocr_exception: {e}"}
+    try:
+        cv_data = run_cv(frame)
+    except Exception as e:
+        cv_data = {"error": f"cv_exception: {e}"}
+
+    # ensure serializable
+    ocr_data = _make_serializable(ocr_data)
+    cv_data = _make_serializable(cv_data)
 
     enriched = {
         **event,
