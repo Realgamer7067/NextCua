@@ -43,6 +43,26 @@ class InputRecorder:
         self.screen_w = 0
         self.screen_h = 0
 
+    def _init_cursor_position(self):
+        """Get the actual cursor position from Hyprland so relative
+        mouse deltas accumulate onto the correct starting point."""
+        try:
+            out = subprocess.check_output(
+                ["hyprctl", "cursorpos"],
+                text=True, stderr=subprocess.DEVNULL, timeout=1,
+            ).strip()
+            # Output looks like "1533, 907"
+            parts = out.split(",")
+            if len(parts) == 2:
+                self.mouse_x = int(parts[0].strip())
+                self.mouse_y = int(parts[1].strip())
+                print(f"Initial cursor position: ({self.mouse_x}, {self.mouse_y})")
+                return
+        except (FileNotFoundError, subprocess.CalledProcessError,
+                subprocess.TimeoutExpired, ValueError):
+            pass
+        print("Warning: Could not get cursor position, defaulting to (0, 0).")
+
     def _detect_screen_size(self):
         try:
             out = subprocess.check_output(
@@ -94,11 +114,31 @@ class InputRecorder:
     def _write_event(self, entry):
         if self._events_file is None:
             return
+        # Attach focused window context to every event
+        entry["window"] = self._get_active_window()
         prefix = "  " if self.event_count == 0 else ",\n  "
         self._events_file.write(prefix + json.dumps(entry))
         self._events_file.flush()
         self.event_count += 1
         self._last_timestamp_ns = entry["timestamp_ns"]
+
+    def _get_active_window(self) -> dict | None:
+        """Query Hyprland for the currently focused window."""
+        try:
+            out = subprocess.check_output(
+                ["hyprctl", "activewindow", "-j"],
+                text=True, stderr=subprocess.DEVNULL, timeout=1,
+            )
+            data = json.loads(out)
+            return {
+                "class": data.get("class", ""),
+                "title": data.get("title", ""),
+                "position": data.get("at"),
+                "size": data.get("size"),
+            }
+        except (FileNotFoundError, subprocess.CalledProcessError,
+                subprocess.TimeoutExpired, json.JSONDecodeError):
+            return None
 
     def _close_events_file(self):
         if self._events_file is None:
@@ -186,9 +226,9 @@ class InputRecorder:
                     continue
                 if event.type == ecodes.EV_REL:
                     if event.code == ecodes.REL_X:
-                        self.mouse_x += event.value
+                        self.mouse_x = max(0, min(self.screen_w - 1, self.mouse_x + event.value))
                     elif event.code == ecodes.REL_Y:
-                        self.mouse_y += event.value
+                        self.mouse_y = max(0, min(self.screen_h - 1, self.mouse_y + event.value))
                     elif event.code in (ecodes.REL_WHEEL, ecodes.REL_HWHEEL):
                         direction = "vertical" if event.code == ecodes.REL_WHEEL else "horizontal"
                         relative_ns = time.time_ns() - self.start_time_ns
@@ -351,7 +391,11 @@ class InputRecorder:
         print(f"Starting fullscreen recording → {self.video_path}")
         try:
             self.recorder_process = subprocess.Popen(
-                ["wf-recorder", "-f", str(self.video_path)],
+                [
+                    "wf-recorder",
+                    "-r", "60",          # 60 FPS CFR — ~16ms between frames
+                    "-f", str(self.video_path),
+                ],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 preexec_fn=os.setsid,
@@ -360,7 +404,21 @@ class InputRecorder:
             print("Error: 'wf-recorder' not found.")
             sys.exit(1)
 
+        # Wait for wf-recorder to actually start writing frames.
+        # The video file is created immediately by Popen, but real data only
+        # appears once the compositor connection + encoder are ready.
+        # We poll until the file has some bytes (> header), capped at 5s.
+        deadline = time.time() + 5.0
+        while time.time() < deadline:
+            try:
+                if self.video_path.stat().st_size > 1024:
+                    break
+            except FileNotFoundError:
+                pass
+            time.sleep(0.05)
+
         self.start_time_ns = time.time_ns()
+        self._init_cursor_position()
         self.is_recording = True
         print("Recording! Press Ctrl+C to stop.\n")
 
@@ -384,8 +442,8 @@ class InputRecorder:
             return
 
         print("\nStopping recording...")
-        self.is_recording = False
 
+        # Stop video FIRST so its duration always covers every logged event.
         if self.recorder_process and self.recorder_process.poll() is None:
             try:
                 os.killpg(os.getpgid(self.recorder_process.pid), signal.SIGINT)
@@ -393,6 +451,9 @@ class InputRecorder:
             except (ProcessLookupError, subprocess.TimeoutExpired):
                 self.recorder_process.kill()
             self.recorder_process = None
+
+        # THEN stop accepting events — nothing new can be written after this.
+        self.is_recording = False
 
         self._close_events_file()
         print(f"Saved {self.event_count} events → {self.events_path}")

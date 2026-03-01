@@ -4,6 +4,9 @@
 # Processed dataset
 .data/
 
+# Model weights (large binaries)
+dataset/models/
+
 # Python
 __pycache__/
 *.pyc
